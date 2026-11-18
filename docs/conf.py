@@ -104,6 +104,7 @@ _REEXPORTS = {
     "CheriBlock": "cherimoya.cheri",
     "ControlWrapper": "cherimoya.wrappers",
     "ProfileWrapper": "cherimoya.wrappers",
+    "NegativeEntropyWrapper": "cherimoya.wrappers",
     "LogCountWrapper": "cherimoya.wrappers",
     "ExpectedCountsWrapper": "cherimoya.wrappers",
 }

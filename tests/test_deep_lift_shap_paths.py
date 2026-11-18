@@ -73,7 +73,8 @@ class _NotCherimoya(torch.nn.Module):
 
 
 @pytest.mark.parametrize("hypothetical", [False, True])
-@pytest.mark.parametrize("output", ["logcounts", "profile"])
+@pytest.mark.parametrize("output", ["logcounts", "profile",
+	"negative_entropy"])
 def test_fast_false_is_tangermemes_deep_lift_shap(model, X, engines, output,
 	hypothetical):
 	ours = _ours(model, X, output=output, hypothetical=hypothetical,
@@ -82,14 +83,17 @@ def test_fast_false_is_tangermemes_deep_lift_shap(model, X, engines, output,
 	assert engines == []
 
 
+@pytest.mark.parametrize("output", ["logcounts", "profile",
+	"negative_entropy"])
 @pytest.mark.parametrize("hypothetical, group", [(False, 0), (True, 0),
 	(True, None)])
 def test_the_fast_path_agrees_with_the_default_path(model, X, forced, engines,
-	hypothetical, group):
-	ours = _ours(model, X, hypothetical=hypothetical, group=group)
+	output, hypothetical, group):
+	ours = _ours(model, X, output=output, hypothetical=hypothetical,
+		group=group)
 	assert len(engines) == 1
-	theirs = _ours(model, X, hypothetical=hypothetical, group=group,
-		fast=False)
+	theirs = _ours(model, X, output=output, hypothetical=hypothetical,
+		group=group, fast=False)
 	assert ours.shape == theirs.shape == X.shape
 	assert ours.dtype == theirs.dtype == torch.float32
 	assert _agreement(ours, theirs)[1] <= REL_L2_MAX
@@ -109,11 +113,11 @@ def test_a_quick_job_takes_the_default_path(model, X, engines):
 
 # bfloat16 rounding is above tangermeme's 1% check on these tiny models.
 @pytest.mark.filterwarnings("ignore:Convergence deltas are")
-@pytest.mark.parametrize("case", ["four sequences", "profile", "fast=False",
+@pytest.mark.parametrize("case", ["four sequences", "fast=False",
 	"bfloat16", "reference function", "not a Cherimoya"])
 def test_what_takes_the_default_path_in_one_call(model, X, forced, engines,
 	case):
-	kwargs = {"four sequences": {}, "profile": {"output": "profile"},
+	kwargs = {"four sequences": {},
 		"fast=False": {"fast": False}, "bfloat16": {"dtype": "bfloat16"},
 		"reference function": {"references": lambda X, n, random_state=None:
 		dinucleotide_shuffle(X, n=n, random_state=random_state)},

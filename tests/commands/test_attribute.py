@@ -149,7 +149,8 @@ def test_attr_window_wider_than_in_window_raises(tmp_path):
 
 
 @pytest.mark.parametrize("output, wrapper", [("logcounts", "LogCountWrapper"),
-	("profile", "ProfileWrapper")])
+	("profile", "ProfileWrapper"),
+	("negative_entropy", "NegativeEntropyWrapper")])
 @pytest.mark.parametrize("algorithm", ["deep_lift_shap",
 	"saturation_mutagenesis"])
 def test_group_reaches_the_wrapper(tmp_path, output, wrapper, algorithm):

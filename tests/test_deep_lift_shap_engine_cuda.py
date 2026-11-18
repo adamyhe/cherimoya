@@ -75,7 +75,8 @@ def strict_fp32():
 def _engine(config, dtype=torch.float32, eager=False, **kwargs):
 	model = tiny.tiny_model(config, dtype=dtype)
 	kwargs.setdefault("device", "cuda")
-	engine = fdls.Engine(model, group=tiny.CONFIGS[config].group, **kwargs)
+	kwargs.setdefault("group", tiny.CONFIGS[config].group)
+	engine = fdls.Engine(model, **kwargs)
 	if eager:
 		engine.forward, engine.backward, engine.epilogue = (fdls.forward_save,
 			fdls.backward_pass, fdls.epilogue)
@@ -100,22 +101,24 @@ def _inaccurate(name, attr, truth):
 
 
 @pytest.mark.triton
+@pytest.mark.parametrize("output", list(fdls.OUTPUTS))
 @pytest.mark.parametrize("config", list(tiny.CONFIGS))
-def test_the_cuda_passes_are_as_accurate_as_the_cpu(config, dynamo_enabled,
-	strict_fp32):
+def test_the_cuda_passes_are_as_accurate_as_the_cpu(config, output,
+	dynamo_enabled, strict_fp32):
 	"""In strict fp32 the eager CUDA passes, the shift-add convolution and the
 	rule's statistics, and the compiled ones are within the bounds the CPU
-	path, the model's own, meets."""
+	path, the model's own, meets, for every head."""
 
 	from torch._dynamo.utils import counters
 
 	X = tiny.sequences(config)
 	R = tiny.shuffled_references(X, K)
-	truth = _engine(config, torch.float64, eager=True).run(X, R).attr
-	cpu = _engine(config, device="cpu").run(X, R).attr
-	eager = _engine(config, eager=True).run(X, R).attr
+	truth = _engine(config, torch.float64, eager=True, output=output).run(X,
+		R).attr
+	cpu = _engine(config, device="cpu", output=output).run(X, R).attr
+	eager = _engine(config, eager=True, output=output).run(X, R).attr
 	counters.clear()
-	compiled = _engine(config).run(X, R).attr
+	compiled = _engine(config, output=output).run(X, R).attr
 	assert counters["stats"]["unique_graphs"] >= 2  # it did compile
 
 	failures = (_inaccurate("cpu", cpu, truth) + _inaccurate("eager", eager,

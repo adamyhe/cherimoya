@@ -21,6 +21,7 @@ or optimize:
 | Wrapper | Returns | Use for |
 |---|---|---|
 | `ProfileWrapper` | scalar per example from profile logits (weighted softmax) | profile **shape** |
+| `NegativeEntropyWrapper` | `sum(p * log(p))` of the profile's softmax | how **peaked** the profile is |
 | `LogCountWrapper` | the log-count prediction | **total signal** (counts) at a locus |
 | `ExpectedCountsWrapper` | expected reads per base pair | per-position expected counts |
 | `ControlWrapper` | raw `(profile, log-count)`, synthesizing a zero control if needed | the **inner** wrapper for control-trained models |
@@ -61,13 +62,13 @@ wrapper = LogCountWrapper(ControlWrapper(model))
 
 For DeepLIFT/SHAP of a Cherimoya model, call Cherimoya's own function. It takes
 the model itself, wraps it as above, registers `attribution_ops()`, and takes a
-fast path for the log-counts where it applies:
+fast path where it applies, for every `output`:
 
 ```python
 from cherimoya.deep_lift_shap import deep_lift_shap
 
 X_attr = deep_lift_shap(model, X, output="logcounts", group=0,
-    hypothetical=True, random_state=0)   # output="profile" for shape
+    hypothetical=True, random_state=0)   # or "profile", "negative_entropy"
 ```
 
 For PISA, the DeepLIFT/SHAP attributions of every profile position, call

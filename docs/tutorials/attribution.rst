@@ -59,6 +59,9 @@ Example JSON:
   for most analyses; uses :class:`cherimoya.LogCountWrapper`).
 * ``"profile"`` — attribute to the predicted profile shape (uses
   :class:`cherimoya.ProfileWrapper`).
+* ``"negative_entropy"`` — attribute to how peaked the predicted profile
+  is, ``sum(p * log(p))`` of its softmax (uses
+  :class:`cherimoya.NegativeEntropyWrapper`).
 
 ``group`` selects which signal group of a multi-group model is
 attributed (see :doc:`../multi_task`); for a single-group model the
@@ -69,8 +72,8 @@ default, ``0``, is the whole output.
 * ``"deep_lift_shap"`` (default) —
   :func:`cherimoya.deep_lift_shap.deep_lift_shap`, with ``n_shuffles``
   dinucleotide-shuffled references per sequence and Cherimoya's DeepLIFT
-  rules registered. It runs ``tangermeme.deep_lift_shap``, or, for the
-  log-counts, a fast path (below). ``batch_size`` counts
+  rules registered. It runs ``tangermeme.deep_lift_shap``, or a fast
+  path (below). ``batch_size`` counts
   sequence-reference pairs, each run forward and backward, on
   tangermeme's path.
 * ``"saturation_mutagenesis"`` — ``tangermeme.saturation_mutagenesis``,
@@ -82,11 +85,10 @@ its backward hooks cause graph breaks and recompiles. Neither algorithm ran
 faster compiled in our measurements, and compiling lengthened the first
 call.
 
-``fast``, true by default, lets DeepLIFT/SHAP of the log-counts take the
-fast path, which runs several times faster on a GPU and is checked against
-tangermeme's ``deep_lift_shap`` on every job that uses it (see `The fast
-path for the log-counts`_). ``"fast": false`` always uses tangermeme's
-``deep_lift_shap``.
+``fast``, true by default, lets DeepLIFT/SHAP take the fast path, which
+runs several times faster on a GPU and is checked against tangermeme's
+``deep_lift_shap`` on every job that uses it (see `The DeepLIFT/SHAP fast
+path`_). ``"fast": false`` always uses tangermeme's ``deep_lift_shap``.
 
 The CLI automatically:
 
@@ -126,7 +128,7 @@ sequence, keeping the central 400 bp.
 
    X_attr = deep_lift_shap(
        model, X,
-       output="logcounts",   # or "profile" for profile shape
+       output="logcounts",   # or "profile", or "negative_entropy"
        group=0,
        n_shuffles=20,
        batch_size=64,
@@ -148,8 +150,9 @@ across the channel axis:
 
 :func:`~cherimoya.deep_lift_shap.deep_lift_shap` wraps the model in
 :class:`cherimoya.ControlWrapper`, which supplies zero control tracks, and
-in :class:`cherimoya.LogCountWrapper` or :class:`cherimoya.ProfileWrapper`
-for ``group``, and registers Cherimoya's DeepLIFT rule. A tangermeme
+in :class:`cherimoya.LogCountWrapper`, :class:`cherimoya.ProfileWrapper`
+or :class:`cherimoya.NegativeEntropyWrapper` for ``group``, and registers
+Cherimoya's DeepLIFT rules. A tangermeme
 function called directly, such as ``tangermeme.deep_lift_shap`` or
 ``tangermeme.pisa``, needs the same: the wrappers, and
 ``additional_nonlinear_ops=attribution_ops()``. The rule is required, not
@@ -165,16 +168,16 @@ attribute group 0 only; pass ``group`` to say which one you mean.
 :func:`~cherimoya.deep_lift_shap.deep_lift_shap` raises instead.
 
 
-The fast path for the log-counts
---------------------------------
+The DeepLIFT/SHAP fast path
+---------------------------
 
-:func:`~cherimoya.deep_lift_shap.deep_lift_shap` computes the log-counts'
-attributions on a fast path where it can, and so does ``cherimoya
-attribute`` with ``"fast": true``, its default. The method is
-tangermeme's: the same rules (tangermeme's rescale rule at every GELU and
-the normalization rule of ``conv_norm_op``), the same dinucleotide-shuffled
-references with the same seeds, and the same hypothetical projection and
-mean over references. What changes is how they are computed:
+:func:`~cherimoya.deep_lift_shap.deep_lift_shap` computes attributions on a
+fast path where it can, and so does ``cherimoya attribute`` with ``"fast":
+true``, its default. The method is tangermeme's: the same rules
+(tangermeme's rescale rule at every GELU and the normalization rule of
+``conv_norm_op``), the same dinucleotide-shuffled references with the same
+seeds, and the same hypothetical projection and mean over references. What
+changes is how they are computed:
 
 * Each sequence is forwarded once per step together with its references,
   rather than once per reference: every operation acts on each row alone,
@@ -189,13 +192,21 @@ mean over references. What changes is how they are computed:
   compiled with ``torch.compile``. Each step's references are drawn with
   one call to tangermeme's ``dinucleotide_shuffle`` while the GPU runs the
   previous step, and the host waits for the GPU once per step.
+* The heads. The log-counts' gradient at the model's last residual stream
+  is the same for every sequence-reference pair. ``"profile"`` and
+  ``"negative_entropy"`` are non-linear in the logits, and their softmax
+  couples every position to every other, so their gradient is each
+  pair's: the wrappers' rules (tangermeme's product and softmax rules, and
+  :func:`~cherimoya.deep_lift_shap.log_softmax_op`) are applied to each
+  pair's logits, in float64, and the profile convolution's input gradient
+  carries the result to the stream. Below the stream the backward is the
+  same for all three outputs.
 
-**When it is used.** The fast path applies to the ``"logcounts"`` of a
+**When it is used.** The fast path applies to every ``output`` of a
 Cherimoya model computed in float32, with dinucleotide-shuffled references
-or references passed in. The profile, whose softmax couples every position
-to every other, other dtypes, other reference functions and jobs of four
-sequences or fewer take tangermeme's ``deep_lift_shap``, and saturation
-mutagenesis is unaffected. Where the fast path applies, every sequence is
+or references passed in. Other dtypes, other reference functions and jobs
+of four sequences or fewer take tangermeme's ``deep_lift_shap``, and
+saturation mutagenesis is unaffected. Where the fast path applies, every sequence is
 checked first as tangermeme checks its input, so an unknown character
 raises the same error with either path; then the first four sequences are
 attributed with tangermeme's ``deep_lift_shap`` and the last two of them
@@ -219,7 +230,24 @@ on, and neither is bitwise reproducible, since cuDNN and Triton pick their
 kernels by timing in each process. On an H200, over 40 peaks with 20
 references each, the per-sequence attributions of the two paths were a
 median relative L2 distance of 6.2e-4, 1.2e-4 and 2.5e-4 apart on trained
-models with 64, 128 and 256 filters.
+models with 64, 128 and 256 filters, for the log-counts.
+
+For ``"profile"`` and ``"negative_entropy"`` the tests hold the fast path
+on the CPU to tangermeme's ``deep_lift_shap`` in float64, to a relative L2
+distance of 1e-9; in float32 they hold both paths to float64, the fast
+path within 2e-4 and no more than 1.25 times as far as tangermeme's
+float32 path. Its CUDA passes are held to the float64 engine within the
+same bounds as the log-counts'. On an RTX 3080, over 40
+sequences with 20 references each, a 64-filter, 8-layer model with the
+tests' redrawn weights gave a largest per-sequence distance between the two
+paths of 2.6e-4 and 2.9e-4 respectively. Near a flat profile, as an
+untrained model predicts, the softmax rules divide small differences of
+nearly equal numbers, and float32 loses most of their digits: on such a
+model the negative entropy's attributions on tangermeme's path were 0.11
+(relative L2) from float64's, and on the fast path, which computes those
+rules in float64, 1e-5. The two paths then disagree beyond the check's
+bounds, and ``deep_lift_shap`` falls back to tangermeme's path with a
+warning.
 
 **Speed.** On an H200, with 1,000 peaks of 2,114 bp and 20 shuffles each,
 the fast path attributed 7,753 sequence-reference pairs per second at
@@ -227,6 +255,13 @@ steady state with a 128-filter, 9-layer model, against 986 to 999 for
 tangermeme's ``deep_lift_shap`` at a ``batch_size`` of 64 after its first
 call. On the CPU with 8 threads, with the same model, it attributed 12.6
 pairs per second against 4.6.
+
+On an RTX 3080, with 200 sequences of 2,114 bp and 20 shuffles each and a
+64-filter, 8-layer model, the fast path attributed 3,080, 2,946 and 2,929
+pairs per second for ``"logcounts"``, ``"profile"`` and
+``"negative_entropy"`` at steady state, against 419, 444 and 526 for
+tangermeme's ``deep_lift_shap`` at a ``batch_size`` of 64 after its first
+call.
 
 **Warnings.** The fast path warns once per call when deltas exceed
 ``warning_threshold``, and once when the mean delta exceeds 1% of the mean
@@ -261,7 +296,7 @@ a stranded group take two calls.
 
 Like :func:`~cherimoya.deep_lift_shap.deep_lift_shap`, it takes a fast path
 where it can, with tangermeme's rules and references and the forward and
-rules of the log-counts' fast path. For every reference of a sequence,
+rules of the DeepLIFT/SHAP fast path. For every reference of a sequence,
 tangermeme's ``pisa`` forwards ``batch_size`` copies of the sequence and of
 the reference, and runs a backward over both halves of that batch for
 every ``batch_size`` output positions. The fast path:
@@ -307,7 +342,7 @@ sequences are attributed with tangermeme's ``pisa``, and the second of them
 is timed. A job that would take tangermeme's path less than thirty seconds
 at that rate stays on it. Otherwise the fast path attributes every
 sequence and is checked against those first two with the bounds of the
-log-counts' fast path, and falls back to tangermeme's ``pisa`` with a
+DeepLIFT/SHAP fast path, and falls back to tangermeme's ``pisa`` with a
 ``RuntimeWarning`` when they disagree or the fast path raises. On a GPU,
 the fast path's first call in a process compiles its passes and kernels:
 in our measurements on an H200, a first call took 5 to 7 seconds longer

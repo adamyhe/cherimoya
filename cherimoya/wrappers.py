@@ -165,6 +165,73 @@ class ProfileWrapper(torch.nn.Module):
 		return self.scaling(logits).sum(dim=-1, keepdims=True)
 
 
+class _ProfileNegativeEntropy(torch.nn.Module):
+	"""The non-linear part of :class:`NegativeEntropyWrapper`, written as
+	modules: ``sum(softmax(logits) * log_softmax(logits))``.
+
+	The softmax and the log-softmax are a ``torch.nn.Softmax`` and a
+	``torch.nn.LogSoftmax``, and their product is a tangermeme
+	``BilinearOp``. tangermeme has rules for the softmax and the product;
+	:func:`cherimoya.deep_lift_shap.attribution_ops` adds the one for the
+	log-softmax, :func:`cherimoya.deep_lift_shap.log_softmax_op`.
+	"""
+
+	def __init__(self):
+		super().__init__()
+		self.softmax = torch.nn.Softmax(dim=-1)
+		self.log_softmax = torch.nn.LogSoftmax(dim=-1)
+		self.product = BilinearOp("...,...->...")
+
+	def forward(self, logits):
+		return self.product(self.softmax(logits), self.log_softmax(logits))
+
+
+class NegativeEntropyWrapper(torch.nn.Module):
+	"""A wrapper that returns the negative entropy of the profile.
+
+	The profile logits are flattened and softmaxed, and the wrapper returns
+	``sum(p * log(p))``, the negative Shannon entropy of the predicted
+	profile in nats, one number per example. It is highest, zero, for a
+	profile with all of its mass at one position, and lowest, ``-log(n)``,
+	for a uniform profile over ``n`` positions, so its attributions show
+	what makes the predicted profile peaked rather than flat. The log-softmax
+	is invariant to a shift of the logits, so they are not mean-centered.
+
+	As in :class:`ProfileWrapper`, every profile channel is flattened
+	together by default, and passing ``group`` restricts the softmax to that
+	group's ``channels x length``.
+
+
+	Parameters
+	----------
+	model: cherimoya.Cherimoya
+		A Cherimoya model, which makes predictions for basepair resolution profiles
+		and also for log counts.
+
+	group: int or None, optional
+		The index into ``model.signal_groups`` of the group to attribute. If
+		None, use every profile channel. Default is None.
+	"""
+
+	def __init__(self, model, group=None):
+		super().__init__()
+		self.model = model
+		self.group = group
+		self.flatten = torch.nn.Flatten()
+		self.entropy = _ProfileNegativeEntropy()
+
+		if group is not None:
+			self._start, self._end = _check_group(model, group)
+
+	def forward(self, X, X_ctl=None):
+		logits = self.model(X, X_ctl=X_ctl)[0]
+		if self.group is not None:
+			logits = logits[:, self._start:self._end]
+
+		logits = self.flatten(logits)
+		return self.entropy(logits).sum(dim=-1, keepdims=True)
+
+
 class LogCountWrapper(torch.nn.Module):
 	"""A wrapper that extracts the log count predictions.
 

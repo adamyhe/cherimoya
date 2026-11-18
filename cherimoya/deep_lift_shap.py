@@ -5,7 +5,8 @@
 DeepLIFT/SHAP attributions of a Cherimoya model, and the DeepLIFT rule for
 the layer of a Cherimoya model that needs one.
 
-`deep_lift_shap` attributes a Cherimoya model's log-counts or profile::
+`deep_lift_shap` attributes a Cherimoya model's log-counts, profile or the
+profile's negative entropy::
 
     from cherimoya import Cherimoya
     from cherimoya.deep_lift_shap import deep_lift_shap
@@ -20,9 +21,10 @@ a Cherimoya model without registering it is not a performance question but
 a correctness one: the attributions come back with no guarantee that they
 sum to the change in the prediction. The non-linear part of the profile
 head, in `ProfileWrapper`, is built from modules tangermeme already has
-rules for. `deep_lift_shap` registers the rule itself; a tangermeme function
-called directly, such as `tangermeme.pisa.pisa`, takes `attribution_ops()`
-as `additional_nonlinear_ops`.
+rules for; `NegativeEntropyWrapper` adds a `torch.nn.LogSoftmax`, whose rule
+is `log_softmax_op`. `deep_lift_shap` registers the rules itself; a
+tangermeme function called directly, such as `tangermeme.pisa.pisa`, takes
+`attribution_ops()` as `additional_nonlinear_ops`.
 
 Build the model with `compile=False` when you intend to attribute it. The
 backward hooks DeepLIFT installs replace gradients, which Inductor cannot
@@ -52,6 +54,7 @@ from .cheri import _cheri_conv
 from .cherimoya import Cherimoya
 from .wrappers import ControlWrapper
 from .wrappers import LogCountWrapper
+from .wrappers import NegativeEntropyWrapper
 from .wrappers import ProfileWrapper
 
 
@@ -146,6 +149,95 @@ def conv_norm_op(module, grad_input, grad_output):
 conv_norm_op._reads = ("input",)
 
 
+def log_softmax_op(module, grad_input, grad_output):
+	"""The DeepLIFT rule for `torch.nn.LogSoftmax`.
+
+	The operation is decomposed as tangermeme's softmax rule decomposes the
+	softmax, without its last step::
+
+		a_i = exp(x_i - c),   s = sum_i a_i,   v = 1 / s,
+		log_softmax(x)_j = (x_j - c) + log(v)
+
+	where c, the larger of the example's and the reference's maxima, is
+	shared by both, so the change in output at j is exactly the change in
+	x_j plus the change in log(v). Each step has an exact multiplier: one
+	for the direct path, the secant (a - a_ref) / (x - x_ref) from x_i to
+	a_i, one from a_i to s, -v * v_ref from s to v, and the secant of the
+	log from v to log(v). Chained against the upstream gradient g::
+
+		grad_j = g_j + m_{x_j -> a_j} * (-v * v_ref)
+			* (dlog(v) / dv) * sum_i g_i
+
+	The multipliers sum exactly to the change in each output, and no
+	probability's logarithm is taken, so none underflows. The two secants
+	fall back, where their changes are below 1e-6, to a_ref and 1 / v_ref,
+	as tangermeme's softmax rule's do.
+
+
+	Parameters
+	----------
+	module: torch.nn.LogSoftmax
+		The module being corrected, carrying the cached `module.input`,
+		the observed batch concatenated with the reference batch along the
+		first axis, and the axis it normalizes over as `module.dim`.
+
+	grad_input: tuple of torch.Tensor
+		The gradient torch would otherwise propagate. Unused.
+
+	grad_output: tuple of torch.Tensor
+		The gradient of the model output with respect to this module's
+		output.
+
+
+	Returns
+	-------
+	grad_input: tuple of one torch.Tensor
+		The replacement gradient with respect to the module's input.
+
+
+	Raises
+	------
+	ValueError
+		If the module normalizes over the batch axis.
+	"""
+
+	dim = module.dim
+	if dim is None or dim < 0:
+		dim = module.input.ndim - 1 if dim is None else module.input.ndim + dim
+
+	if dim == 0:
+		raise ValueError("LogSoftmax over the batch axis is not supported. "
+			"DeepLIFT stacks each example with its reference along that axis, "
+			"so normalizing over it would mix the two.")
+
+	dtype = torch.promote_types(module.input.dtype, torch.float32)
+	x, x_ref = module.input.to(dtype).chunk(2, dim=0)
+	grad_out = grad_output[0].to(dtype)
+
+	c = torch.maximum(x.max(dim=dim, keepdim=True).values,
+		x_ref.max(dim=dim, keepdim=True).values)
+	a, a_ref = torch.exp(x - c), torch.exp(x_ref - c)
+	tiny = torch.finfo(dtype).tiny
+	v = a.sum(dim=dim, keepdim=True).clamp_min(tiny).reciprocal()
+	v_ref = a_ref.sum(dim=dim, keepdim=True).clamp_min(tiny).reciprocal()
+
+	delta_x = x - x_ref
+	mult_x_to_a = torch.where(delta_x.abs() > 1e-6, (a - a_ref) / delta_x,
+		a_ref)
+	delta_v = v - v_ref
+	mult_v_to_log_v = torch.where(delta_v.abs() > 1e-6,
+		(torch.log(v) - torch.log(v_ref)) / delta_v, v_ref.reciprocal())
+
+	# The multiplier from a_i through s and v to log(v), shared by every j.
+	shared = mult_x_to_a * (-v * v_ref) * mult_v_to_log_v
+	grad = torch.cat([g + shared * g.sum(dim=dim, keepdim=True)
+		for g in grad_out.chunk(2, dim=0)])
+	return (grad.to(grad_output[0].dtype),)
+
+
+log_softmax_op._reads = ("input",)
+
+
 def attribution_ops() -> dict:
 	"""The rules DeepLIFT needs to attribute a Cherimoya model correctly.
 
@@ -154,13 +246,15 @@ def attribution_ops() -> dict:
 	`tangermeme.pisa.pisa`. A fresh dictionary is returned each call, so
 	adding a rule of your own to it does not affect the next caller.
 
-	One entry: `FusedDilatedConvNorm` gets `conv_norm_op`, described
-	above. The profile head needs none. `ProfileWrapper` multiplies its
-	logits by their own softmax through a `torch.nn.Softmax` and a
-	tangermeme `BilinearOp`, and tangermeme has a rule for each. Do not add
-	a rule for `_ProfileLogitScaling`, the module holding those two: it
-	would take the place of both, and an elementwise rule cannot represent
-	a softmax, which couples every position to every other.
+	Two entries. `FusedDilatedConvNorm` gets `conv_norm_op`, described
+	above, and `torch.nn.LogSoftmax` gets `log_softmax_op`, which
+	`NegativeEntropyWrapper` needs. `ProfileWrapper` needs no other:
+	it multiplies its logits by their own softmax through a
+	`torch.nn.Softmax` and a tangermeme `BilinearOp`, and tangermeme has a
+	rule for each. Do not add a rule for `_ProfileLogitScaling`, the module
+	holding those two: it would take the place of both, and an elementwise
+	rule cannot represent a softmax, which couples every position to every
+	other.
 
 
 	Returns
@@ -171,8 +265,12 @@ def attribution_ops() -> dict:
 
 	return {
 		FusedDilatedConvNorm: conv_norm_op,
+		torch.nn.LogSoftmax: log_softmax_op,
 	}
 
+
+OUTPUTS = ("logcounts", "profile", "negative_entropy")
+"""The outputs `deep_lift_shap` attributes."""
 
 _CHECK_SEQUENCES = 4
 """`deep_lift_shap` attributes the first this many sequences with the default
@@ -194,11 +292,12 @@ relative L2 distance at most `_CHECK_REL_L2_MAX`."""
 
 
 def _make_wrapper(model, output, group):
-	"""`LogCountWrapper` or `ProfileWrapper` over `ControlWrapper(model)`,
-	the module `cherimoya attribute` attributes."""
+	"""`LogCountWrapper`, `ProfileWrapper` or `NegativeEntropyWrapper` over
+	`ControlWrapper(model)`, the module `cherimoya attribute` attributes."""
 
-	if output not in ("logcounts", "profile"):
-		raise ValueError("output must be either `logcounts` or `profile`.")
+	if output not in OUTPUTS:
+		raise ValueError("output must be one of {}.".format(", ".join(
+			"`{}`".format(o) for o in OUTPUTS)))
 
 	if output == "logcounts" and group is None and len(model.signal_groups) > 1:
 		raise ValueError("deep_lift_shap attributes one output; set `group` "
@@ -208,6 +307,9 @@ def _make_wrapper(model, output, group):
 	inner = ControlWrapper(model)
 	if output == "logcounts":
 		return LogCountWrapper(inner, group=group)
+
+	if output == "negative_entropy":
+		return NegativeEntropyWrapper(inner, group=group)
 
 	return ProfileWrapper(inner, group=group)
 
@@ -230,18 +332,18 @@ def deep_lift_shap(model, X, output="logcounts", group=0, batch_size=32,
 	references=dinucleotide_shuffle, n_shuffles=20, hypothetical=False,
 	warning_threshold=0.001, dtype=None, device=None, random_state=None,
 	verbose=False, fast=True):
-	"""DeepLIFT/SHAP attributions of a Cherimoya model's log-counts or
-	profile.
+	"""DeepLIFT/SHAP attributions of a Cherimoya model's log-counts,
+	profile, or the profile's negative entropy.
 
 	The model is attributed as `cherimoya attribute` attributes it: wrapped
 	in `ControlWrapper`, which gives it all-zero control tracks, and then in
-	`LogCountWrapper` or `ProfileWrapper` for `group`, with
-	`attribution_ops()` registered for its fused convolution and
-	normalization.
+	`LogCountWrapper`, `ProfileWrapper` or `NegativeEntropyWrapper` for
+	`group`, with `attribution_ops()` registered for its fused convolution
+	and normalization and the negative entropy's log-softmax.
 
 	There are two paths. The default path is tangermeme's `deep_lift_shap`,
 	which attributes through backward hooks on the model's modules. The fast
-	path computes the same attributions of the log-counts from a forward
+	path computes the same attributions from a forward
 	and a backward pass written out for Cherimoya's architecture, with
 	tangermeme's DeepLIFT rules and references: each sequence is forwarded
 	once rather than once per reference, and the backward pass runs over the
@@ -250,7 +352,7 @@ def deep_lift_shap(model, X, output="logcounts", group=0, batch_size=32,
 	rounding, which on a GPU is the rounding of TF32, which ``import
 	cherimoya`` turns on for matrix products.
 
-	The fast path is used when `fast` is True, `output` is "logcounts",
+	The fast path is used when `fast` is True,
 	`model` is a `Cherimoya` that runs in float32, `X` is a tensor of more
 	than four sequences, and `references` is `dinucleotide_shuffle` or a
 	tensor. All of `X` and the references are then checked as tangermeme
@@ -283,13 +385,16 @@ def deep_lift_shap(model, X, output="logcounts", group=0, batch_size=32,
 		unknown characters.
 
 	output: str, optional
-		"logcounts", to attribute the log-count prediction of `group`, or
-		"profile", to attribute the profile through `ProfileWrapper`.
-		Default is "logcounts".
+		"logcounts", to attribute the log-count prediction of `group`;
+		"profile", to attribute the profile through `ProfileWrapper`; or
+		"negative_entropy", to attribute the negative entropy of the
+		profile, ``sum(p * log(p))`` of its softmax, through
+		`NegativeEntropyWrapper`. Default is "logcounts".
 
 	group: int or None, optional
 		The index into ``model.signal_groups`` of the group to attribute.
-		None attributes every group: for "profile", their profiles together,
+		None attributes every group: for "profile" and "negative_entropy",
+		their profiles together,
 		and for "logcounts", only on a model with one group, since
 		DeepLIFT/SHAP attributes one output. Default is 0.
 
@@ -366,7 +471,7 @@ def deep_lift_shap(model, X, output="logcounts", group=0, batch_size=32,
 	float32 = dtype in (None, "float32", torch.float32) and all(
 		p.dtype == torch.float32 for p in model.parameters())
 	n, half = _CHECK_SEQUENCES, _CHECK_SEQUENCES // 2
-	if not (fast and output == "logcounts" and isinstance(model, Cherimoya)
+	if not (fast and isinstance(model, Cherimoya)
 			and float32 and isinstance(X, torch.Tensor) and len(X) > n
 			and (references is dinucleotide_shuffle or given)):
 		return finish(default(X, references))
@@ -396,7 +501,7 @@ def deep_lift_shap(model, X, output="logcounts", group=0, batch_size=32,
 			if device is None:
 				device = "cuda" if torch.cuda.is_available() else "cpu"
 
-			engine = Engine(model, group=group, device=device,
+			engine = Engine(model, output=output, group=group, device=device,
 				n_shuffles=n_shuffles, random_state=random_state,
 				warning_threshold=warning_threshold)
 			attributions = engine.run(X, references if given else None,

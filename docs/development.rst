@@ -191,8 +191,9 @@ the ``cherimoya`` CLI:
    * - ``tests/test_deep_lift_shap_engine.py``
      - The fast DeepLIFT/SHAP engine against tangermeme's
        ``deep_lift_shap`` on small models, with four kinds of
-       references: hypothetical attributions, outputs, convergence
-       deltas, step-size invariance, and its two convergence warnings.
+       references, for the log-counts, the profile and the negative
+       entropy: hypothetical attributions, outputs, convergence deltas,
+       step-size invariance, and its two convergence warnings.
    * - ``tests/test_deep_lift_shap_paths.py``
      - :func:`~cherimoya.deep_lift_shap.deep_lift_shap`'s choice between
        tangermeme's ``deep_lift_shap`` and the fast path: ``fast=False``
@@ -201,7 +202,8 @@ the ``cherimoya`` CLI:
        input, and the fallback when the fast path disagrees or raises.
    * - ``tests/test_deep_lift_shap_engine_cuda.py``
      - The engine on a GPU: its CUDA passes against the CPU path and its
-       compiled passes against eager ones, both against float64; a run
+       compiled passes against eager ones, both against float64, for
+       every output; a run
        at the default model's size, for what compiles, the host
        synchronizations and the memory; recovery from running out of
        memory.

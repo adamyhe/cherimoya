@@ -7,7 +7,7 @@ Thin :class:`torch.nn.Module` wrappers around a :class:`~cherimoya.Cherimoya`
 that expose a single tensor from its ``(profile, log-count)`` output, so the
 model can be dropped straight into attribution and design tools that expect a
 one-tensor forward pass, plus :class:`ControlWrapper`, which supplies a
-zero control track to models that expect one. All four are re-exported from
+zero control track to models that expect one. All five are re-exported from
 the top-level ``cherimoya`` namespace.
 
 
@@ -63,6 +63,30 @@ together, so one softmax spans all of them and the output summarizes the
 whole profile head. ``ProfileWrapper(model, group=i)`` restricts the
 calculation to group ``i``'s channels, which is how to attribute one
 modality's profile shape (see :doc:`../multi_task`).
+
+
+NegativeEntropyWrapper
+----------------------
+
+.. autoclass:: NegativeEntropyWrapper
+   :members: forward
+   :undoc-members:
+   :show-inheritance:
+
+   .. rubric:: Constructor
+
+   .. automethod:: __init__
+
+Returns ``sum(p * log(p))`` of the softmax ``p`` of the flattened profile
+logits: the negative entropy of the predicted profile, one number per
+example. It is zero for a profile with all of its mass at one position and
+``-log(n)`` for a uniform one over ``n`` positions, so its attributions show
+what makes the predicted profile peaked. This is the wrapper used by
+``cherimoya attribute`` when ``output`` is ``"negative_entropy"``. Its
+log-softmax needs the DeepLIFT rule
+:func:`cherimoya.deep_lift_shap.log_softmax_op`, which
+:func:`~cherimoya.deep_lift_shap.attribution_ops` includes. ``group``
+works as for :class:`ProfileWrapper`.
 
 
 LogCountWrapper

@@ -1,5 +1,6 @@
 """Tests for the DeepLIFT rules in ``cherimoya.deep_lift_shap``."""
 
+import types
 import warnings
 
 import pytest
@@ -8,6 +9,8 @@ import torch.nn.functional as F
 
 from numpy.testing import assert_array_almost_equal
 
+from tangermeme._deep_lift_utils import _nonlinear
+from tangermeme.deep_lift_shap import BilinearOp
 from tangermeme.deep_lift_shap import deep_lift_shap
 from tangermeme.deep_lift_shap import integrated_gradients_op
 from tangermeme.ersatz import dinucleotide_shuffle
@@ -15,9 +18,11 @@ from tangermeme.utils import random_one_hot
 
 from cherimoya import Cherimoya
 from cherimoya import LogCountWrapper
+from cherimoya import NegativeEntropyWrapper
 from cherimoya import ProfileWrapper
 from cherimoya.deep_lift_shap import attribution_ops
 from cherimoya.deep_lift_shap import conv_norm_op
+from cherimoya.deep_lift_shap import log_softmax_op
 from cherimoya.cheri import CONV_NORM_EPS
 from cherimoya.cheri import FusedDilatedConvNorm
 
@@ -258,7 +263,8 @@ def small_model():
 		compile=False).eval()
 
 
-@pytest.mark.parametrize("wrapper", [LogCountWrapper, ProfileWrapper])
+@pytest.mark.parametrize("wrapper", [LogCountWrapper, ProfileWrapper,
+	NegativeEntropyWrapper])
 def test_attribution_ops_converges_on_a_real_model(small_model, wrapper):
 	length = 2 * small_model.trimming + 64
 	X = random_one_hot((2, 4, length), random_state=0).type(torch.float32)
@@ -273,7 +279,8 @@ def test_attribution_ops_converges_on_a_real_model(small_model, wrapper):
 	assert delta < scale / 1e4
 
 
-@pytest.mark.parametrize("wrapper", [LogCountWrapper, ProfileWrapper])
+@pytest.mark.parametrize("wrapper", [LogCountWrapper, ProfileWrapper,
+	NegativeEntropyWrapper])
 def test_attribution_ops_converges_on_one_signal_group(wrapper):
 	"""Selecting one group of a multi-group model with `group=` keeps the
 	attributions summing to the change in that group's prediction."""
@@ -411,6 +418,139 @@ def test_conv_norm_op_matches_the_decomposed_model_on_cuda(X, references):
 
 	assert X_attr.shape == X.shape
 	assert_array_almost_equal(X_attr.cpu(), X_attr_decomposed.cpu(), 6)
+
+
+# --------- log_softmax_op --------------------------------------------------
+
+
+def _log_softmax_rule(x, x_ref, g, dim=-1):
+	"""log_softmax_op's gradient for the sequence half, given the upstream
+	gradient g on both halves."""
+
+	module = types.SimpleNamespace(input=torch.cat([x, x_ref]), dim=dim)
+	grad, = log_softmax_op(module, None, (torch.cat([g, g]),))
+	return grad[:len(x)]
+
+
+@pytest.mark.parametrize("scale", [1e-3, 1.0, 30.0])
+def test_log_softmax_op_sums_to_the_change_in_output(scale):
+	"""sum_j grad_j (x_j - x_ref_j) = sum_j g_j (lp_j - lp_ref_j), exactly,
+	for logits far apart and close together, in float64."""
+
+	gen = torch.Generator().manual_seed(0)
+	x = torch.randn(6, 50, generator=gen, dtype=torch.float64) * 5
+	x_ref = x + torch.randn(6, 50, generator=gen, dtype=torch.float64) * scale
+	g = torch.randn(6, 50, generator=gen, dtype=torch.float64)
+
+	grad = _log_softmax_rule(x, x_ref, g)
+	lhs = (grad * (x - x_ref)).sum(dim=-1)
+	rhs = (g * (torch.log_softmax(x, -1) - torch.log_softmax(x_ref, -1))).sum(
+		dim=-1)
+	torch.testing.assert_close(lhs, rhs, rtol=1e-10, atol=1e-12)
+
+
+def test_log_softmax_op_is_the_gradient_when_nothing_moves():
+	"""At x = x_ref every secant falls back to the derivative at the
+	reference, and the rule is the ordinary vector-Jacobian product,
+	g - softmax(x) * sum(g)."""
+
+	gen = torch.Generator().manual_seed(1)
+	x = torch.randn(4, 30, generator=gen, dtype=torch.float64)
+	g = torch.randn(4, 30, generator=gen, dtype=torch.float64)
+
+	expected = g - torch.softmax(x, -1) * g.sum(dim=-1, keepdim=True)
+	torch.testing.assert_close(_log_softmax_rule(x, x, g), expected)
+
+
+def test_log_softmax_op_does_not_underflow():
+	"""A logit 1,000 below the others has a probability of exp(-1000),
+	zero in float32, and its rule stays finite."""
+
+	x = torch.zeros(1, 8)
+	x[0, 0] = -1000.0
+	x_ref = torch.zeros(1, 8)
+	grad = _log_softmax_rule(x, x_ref, torch.ones(1, 8))
+	assert bool(torch.isfinite(grad).all())
+
+
+def test_log_softmax_op_rejects_the_batch_axis():
+	module = types.SimpleNamespace(input=torch.zeros(4, 3), dim=0)
+	with pytest.raises(ValueError, match="batch axis"):
+		log_softmax_op(module, None, (torch.zeros(4, 3),))
+
+
+def test_negative_entropy_needs_log_softmax_op(small_model):
+	"""Without `log_softmax_op` the log-softmax is treated as linear and
+	the negative entropy's attributions do not sum to its change."""
+
+	length = 2 * small_model.trimming + 64
+	X = random_one_hot((2, 4, length), random_state=0).type(torch.float32)
+	references = dinucleotide_shuffle(X, n=2, random_state=0)
+	model = NegativeEntropyWrapper(small_model)
+
+	ops = attribution_ops()
+	with_rule = _worst_delta(model, X, references, ops)
+	del ops[torch.nn.LogSoftmax]
+	without_rule = _worst_delta(model, X, references, ops)
+
+	assert without_rule > 100 * with_rule
+
+
+class _Log(torch.nn.Module):
+	def forward(self, x):
+		return torch.log(x)
+
+
+class _SoftmaxThenLogEntropy(torch.nn.Module):
+	"""`_ProfileNegativeEntropy` with the log-softmax written as a softmax
+	followed by a log, which tangermeme's rescale rule covers."""
+
+	def __init__(self):
+		super().__init__()
+		self.softmax = torch.nn.Softmax(dim=-1)
+		self.log = _Log()
+		self.product = BilinearOp("...,...->...")
+
+	def forward(self, logits):
+		p = self.softmax(logits)
+		return self.product(p, self.log(p))
+
+
+def test_log_softmax_op_beats_a_softmax_then_a_log(small_model):
+	"""In exact arithmetic `log_softmax_op` equals tangermeme's softmax
+	rule followed by the rescale rule at a log: the log's secant cancels
+	the softmax rule's last one. In floating point the composition breaks
+	once some probabilities are tiny. The two secants have their own 1e-6
+	fallbacks, which no longer fire together, and the log's secant divides
+	by changes in probabilities near zero. Scaling the profile head's
+	weights by 400 sharpens the profile until its smallest probabilities
+	are about 1e-16, which is where that happens. At a scale of 200 on this
+	model the two still agree."""
+
+	with torch.no_grad():
+		small_model.fconv.weight.mul_(400)
+
+	length = 2 * small_model.trimming + 64
+	X = random_one_hot((2, 4, length), random_state=0).type(torch.float32)
+	references = dinucleotide_shuffle(X, n=2, random_state=0)
+
+	model = NegativeEntropyWrapper(small_model)
+	with torch.no_grad():
+		scale = float(model(X).abs().mean())
+
+	ops = attribution_ops()
+	with_rule = _worst_delta(model, X, references, ops)
+
+	model.entropy = _SoftmaxThenLogEntropy()
+	ops[_Log] = _nonlinear
+	composed = _worst_delta(model, X, references, ops)
+
+	assert with_rule < scale / 1e4
+	assert composed > 1000 * with_rule
+
+
+def test_log_softmax_op_declares_it_reads_only_the_input():
+	assert log_softmax_op._reads == ("input",)
 
 
 def test_conv_norm_op_declares_it_reads_only_the_input():

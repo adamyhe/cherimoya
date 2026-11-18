@@ -2,7 +2,8 @@
 # Author: Eugenio Mattei
 
 """
-A fast DeepLIFT/DeepSHAP engine for the log-counts of a Cherimoya model.
+A fast DeepLIFT/DeepSHAP engine for the log-counts and the profile of a
+Cherimoya model.
 
 `tangermeme.deep_lift_shap.deep_lift_shap` attributes a model through
 backward hooks, over batches that hold each sequence-reference pair as two
@@ -22,6 +23,14 @@ from a forward and a backward written out by hand:
   (`_layer_normalization_stats`, `_terms` and `_grad`), called as tensor
   functions. The references are tangermeme's `dinucleotide_shuffle`, drawn
   with the seeds `deep_lift_shap` uses.
+* The heads. The log-count's gradient at the final residual stream is the
+  same for every pair. The profile objectives, `ProfileWrapper`'s and
+  `NegativeEntropyWrapper`'s, are non-linear in the logits, so their
+  gradient is each pair's: `profile_head_rule` applies the wrappers' rules
+  (tangermeme's `_bilinear` midpoint rule, written out, its `_softmax` and
+  `cherimoya.deep_lift_shap.log_softmax_op`) to the pair's logits, and the
+  profile convolution's input gradient carries it to the stream. The
+  backward below the stream is the same for every head.
 
 Rows are laid out as ``[x_0, ..., x_{S-1}, r_00, ..., r_{S-1,K-1}]``: S
 sequences, then the K references of each. `split_rows` views them as
@@ -39,6 +48,7 @@ import gc
 import inspect
 import logging
 import time
+import types
 import warnings
 
 from typing import NamedTuple
@@ -51,6 +61,7 @@ from tangermeme._deep_lift_utils import _layer_normalization_grad
 from tangermeme._deep_lift_utils import _layer_normalization_stats
 from tangermeme._deep_lift_utils import _layer_normalization_terms
 from tangermeme._deep_lift_utils import _rescale
+from tangermeme._deep_lift_utils import _softmax
 from tangermeme.deep_lift_shap import hypothetical_attributions
 from tangermeme.ersatz import dinucleotide_shuffle
 from tqdm import tqdm
@@ -63,6 +74,9 @@ from .cheri import _cheri_conv_norm_cpu
 logger = logging.getLogger(__name__)
 
 ICONV_PADDING = 10
+FCONV_PADDING = 37
+
+OUTPUTS = ("logcounts", "profile", "negative_entropy")
 
 CPU_SEQS_PER_STEP = 8
 MAX_SEQS_PER_STEP = 32
@@ -211,10 +225,82 @@ def ln_rule(Gn, y, mu, v, S, K):
 	return _layer_normalization_grad(Gn, *terms, 2)
 
 
+def _pair_rule(rule, x, r, grad):
+	"""A tangermeme-style module rule, `rule(module, grad_input,
+	grad_output)`, applied to P pairs: x and r (P, M) are each pair's
+	sequence and reference inputs and grad (P, M) the gradient at each
+	pair's output. Returns the sequence half of the rule's gradient, (P, M).
+
+	The rule sees what tangermeme's hook gives it, the two halves stacked
+	along the first axis, with the same gradient on both halves; a
+	sequence row's gradient never depends on its reference row's."""
+
+	module = types.SimpleNamespace(input=torch.cat([x, r]), dim=-1)
+	grad_in, = rule(module, None, (torch.cat([grad, grad]),))
+	return grad_in[:len(x)]
+
+
+def profile_head_rule(logits, S, K, output):
+	"""The profile objective of each row, and its DeepLIFT gradient at the
+	logits for each pair.
+
+	logits (S + S*K, M) holds each row's flattened logits, sequences, then
+	their references. `output` is "profile", `ProfileWrapper`'s
+	``sum(z * softmax(z))`` of the mean-centered logits z, or
+	"negative_entropy", `NegativeEntropyWrapper`'s ``sum(p * log_softmax(l))``
+	with p the softmax. The product is tangermeme's `_bilinear` midpoint
+	rule: each operand's gradient is the mean of the other operand's
+	sequence and reference values, times the upstream gradient of one. The
+	softmax and log-softmax gradients are their rules', `_softmax` and
+	`log_softmax_op`, applied to the pairs; the gradients of the two
+	branches sum where autograd sums them, at their shared input, and the
+	mean-centering is linear.
+
+
+	Returns
+	-------
+	y: torch.Tensor, shape=(S + S*K,)
+		The objective of every row.
+
+	grad: torch.Tensor, shape=(S*K, M)
+		Each pair's gradient at the logits.
+	"""
+
+	from .deep_lift_shap import log_softmax_op
+
+	if output == "profile":
+		logits = logits - logits.mean(dim=-1, keepdim=True)
+
+	M = logits.shape[-1]
+
+	def pairs(t):
+		"""The rows (S + S*K, M) as each pair's sequence and reference rows,
+		(S*K, M) each."""
+
+		return (h.expand(S, K, M).reshape(S * K, M) for h in split_rows(t, S, K))
+
+	p = torch.softmax(logits, dim=-1)
+	zx, zr = pairs(logits)
+	px, pr = pairs(p)
+
+	if output == "profile":
+		y = (logits * p).sum(dim=-1)
+		grad = 0.5 * (px + pr) + _pair_rule(_softmax, zx, zr, 0.5 * (zx + zr))
+		grad = grad - grad.mean(dim=-1, keepdim=True)
+	else:
+		lp = torch.log_softmax(logits, dim=-1)
+		lx, lr = pairs(lp)
+		y = (p * lp).sum(dim=-1)
+		grad = (_pair_rule(_softmax, zx, zr, 0.5 * (lx + lr))
+			+ _pair_rule(log_softmax_op, zx, zr, 0.5 * (px + pr)))
+
+	return y, grad
+
+
 def backward_pass(G0, saved, z0, blocks, rs, S, K):
 	"""The backward over the S*K pairs, from the final residual stream to
-	iconv's output: G0 (L, C), the count gradient every pair shares, ->
-	(S*K, C, L).
+	iconv's output: G0, the gradient at the stream, (L, C) when every pair
+	shares it, as the count gradient, or (S, K, L, C), -> (S*K, C, L).
 
 	Each block computes ``h + linear2(GELU(linear1(conv_norm(h)))) * rs``.
 	Backwards through each, last block first: the ordinary gradient through
@@ -225,7 +311,7 @@ def backward_pass(G0, saved, z0, blocks, rs, S, K):
 	a copy. On CUDA this function runs compiled.
 	"""
 
-	L, C = G0.shape
+	L, C = G0.shape[-2:]
 	G = G0.expand(S, K, L, C)
 	for s, block in zip(reversed(saved), reversed(blocks)):
 		Gu = gelu_rescale(torch.matmul(G * rs, block.W2), s.u, S, K)
@@ -256,7 +342,7 @@ def epilogue(m, X1h, y_x, y_r, S, K):
 	return hyp.view(S, K, *hyp.shape[1:]).mean(dim=1), delta
 
 
-def step_bytes(S, K, L, C, H, n_blocks, itemsize=4):
+def step_bytes(S, K, L, C, H, n_blocks, itemsize=4, n_channels=0):
 	"""The bytes one step of S sequences with K references each allocates on
 	the device, estimated analytically.
 
@@ -269,13 +355,18 @@ def step_bytes(S, K, L, C, H, n_blocks, itemsize=4):
 	the backward's transients, counted the same way (3 (L x C) + 2 (L x H)),
 	and the multipliers (4 x L). The forward's and the backward's transients
 	never coexist, so the sum overestimates by the smaller of the two.
+	For a profile head of `n_channels` channels, also the logits and their
+	softmaxes per row (3 n_channels x L), and per pair the head's gradient
+	at the stream (L x C) and the rule's transients (8 n_channels x L).
 	cuDNN's workspace and the weights are not counted.
 	"""
 
 	rows, pairs = S * (K + 1), S * K
 	per_row = (itemsize * L * (C + n_blocks * (C + H))
-		+ itemsize * L * (4 * C + H) + itemsize * 4 * L + 4 * L)
-	per_pair = itemsize * L * (3 * C + 2 * H) + itemsize * 4 * L
+		+ itemsize * L * (4 * C + H) + itemsize * 4 * L + 4 * L
+		+ itemsize * 3 * n_channels * L)
+	per_pair = (itemsize * L * (3 * C + 2 * H) + itemsize * 4 * L
+		+ bool(n_channels) * itemsize * L * C + itemsize * 8 * n_channels * L)
 	return rows * per_row + pairs * per_pair
 
 
@@ -299,9 +390,10 @@ def _joint_rows(X, references, S, pin_memory):
 
 
 class Engine:
-	"""DeepLIFT/DeepSHAP attributions of a Cherimoya model's count head:
-	what ``deep_lift_shap(LogCountWrapper(ControlWrapper(model), group), X,
-	hypothetical=True, ...)`` computes.
+	"""DeepLIFT/DeepSHAP attributions of a Cherimoya model's count head or
+	profile: what ``deep_lift_shap(Wrapper(ControlWrapper(model), group), X,
+	hypothetical=True, ...)`` computes, with `LogCountWrapper`,
+	`ProfileWrapper` or `NegativeEntropyWrapper` as the wrapper.
 
 	The engine works in steps of S whole sequences, each with its K
 	references. A step's joint rows are forwarded once, the backward runs
@@ -340,9 +432,14 @@ class Engine:
 		The model, with float32 parameters, or float64 ones for tests. It is
 		not changed.
 
+	output: str, optional
+		"logcounts", "profile" or "negative_entropy": the wrapper's output.
+		Default is "logcounts".
+
 	group: int or None, optional
-		The signal group to attribute, as `LogCountWrapper` takes it. None
-		attributes the first group. Default is 0.
+		The signal group to attribute, as the wrapper takes it. None
+		attributes the first group's log-count, or the profile of every
+		group together. Default is 0.
 
 	device: str or torch.device or None, optional
 		Where the steps run. None means the model's device. Default is None.
@@ -362,8 +459,13 @@ class Engine:
 		S, or None to choose it as described above. Default is None.
 	"""
 
-	def __init__(self, model, group=0, device=None, n_shuffles=20,
-		random_state=0, warning_threshold=1e-3, seqs_per_step=None):
+	def __init__(self, model, output="logcounts", group=0, device=None,
+		n_shuffles=20, random_state=0, warning_threshold=1e-3,
+		seqs_per_step=None):
+
+		if output not in OUTPUTS:
+			raise ValueError("output must be one of {}, got {!r}".format(
+				OUTPUTS, output))
 
 		if device is None:
 			device = model.iconv.weight.device
@@ -378,6 +480,19 @@ class Engine:
 			get(b.linear1.weight), get(b.linear2.weight), int(b.dilation))
 			for b in model.blocks)
 		self.Wl, self.bl = get(model.linear.weight), get(model.linear.bias)
+		self.output = output
+
+		# The profile convolution's taps on the stream, for the attributed
+		# channels; the control tracks' are multiplied by zeros.
+		groups = list(model.signal_groups)
+		if group is None:
+			start, end = 0, sum(groups)
+		else:
+			start = sum(groups[:group])
+			end = start + groups[group]
+
+		self.Wf = get(model.fconv.weight[start:end, :model.n_filters])
+		self.bf = get(model.fconv.bias[start:end])
 		self.rs = float(model.residual_scale)
 		self.T = int(model.trimming)
 		self.C, self.H = model.n_filters, model.expansion * model.n_filters
@@ -455,7 +570,9 @@ class Engine:
 		# and applies the count Linear, and the control tracks' feature is a
 		# constant.
 		G0 = torch.zeros(L, self.C, dtype=dtype, device=self.device)
-		G0[self.T:L - self.T] = self.Wl[self.group, :self.C] / (L - 2 * self.T)
+		if self.output == "logcounts":
+			G0[self.T:L - self.T] = (self.Wl[self.group, :self.C]
+				/ (L - 2 * self.T))
 
 		began = time.perf_counter()
 		device = (torch.cuda.device(self.device) if self.device.type == "cuda"
@@ -501,7 +618,8 @@ class Engine:
 			available = (free + torch.cuda.memory_reserved(self.device)
 				- torch.cuda.memory_allocated(self.device))
 			per_sequence = step_bytes(1, K, L, self.C, self.H,
-				len(self.blocks), self.W0.dtype.itemsize)
+				len(self.blocks), self.W0.dtype.itemsize,
+				0 if self.output == "logcounts" else len(self.Wf))
 			S = int(min(MEM_BUDGET, FREE_MEMORY_FRACTION * available)
 				// per_sequence)
 			S = max(1, min(MAX_SEQS_PER_STEP, S))
@@ -544,6 +662,38 @@ class Engine:
 
 		return F.linear(pooled, self.Wl, self.bl)[:, self.group]
 
+	def _profile_head(self, hL, S, K):
+		"""The profile objective of each row and each pair's gradient at the
+		final residual stream, (S, K, L, C), from the stream hL (R, L, C).
+
+		The logits are the profile convolution's at positions [T, L - T)
+		for the attributed channels, flattened channel by channel as the
+		wrappers flatten them. The gradient at the logits is
+		`profile_head_rule`'s, and the convolution's input gradient, the call
+		autograd makes, carries it to the stream.
+
+		The rules run in float64, on the float32 logits. Their secants divide
+		the change in a softmax or a log-softmax by the change in a logit,
+		and near a flat profile both are small differences of numbers near
+		-log(n): in float32 the attributions of an untrained model, whose
+		profile is nearly uniform, were 0.11 (relative L2) from float64's on
+		either path, and 1e-5 with the rules in float64.
+		"""
+
+		R, L, C = hL.shape
+		H = hL.transpose(1, 2).contiguous()
+		logits = F.conv1d(H, self.Wf, self.bf, padding=FCONV_PADDING)
+		n = len(self.Wf)
+		y, grad = profile_head_rule(logits[:, :, self.T:L - self.T]
+			.reshape(R, -1).double(), S, K, self.output)
+		y, grad = y.to(hL.dtype), grad.to(hL.dtype)
+
+		G = grad.new_zeros(S * K, n, L)
+		G[:, :, self.T:L - self.T] = grad.view(S * K, n, -1)
+		G = torch.nn.grad.conv1d_input((S * K, C, L), self.Wf, G,
+			padding=FCONV_PADDING)
+		return y, G.transpose(1, 2).reshape(S, K, L, C)
+
 	def _step(self, inputs, S, K, G0):
 		"""One step on the engine's device: the joint rows (S + S*K, 4, L), an
 		int8 one-hot, -> the step's results, on the device. Each large
@@ -553,9 +703,14 @@ class Engine:
 		X1h = inputs.to(self.W0.dtype)
 		z0 = F.conv1d(X1h, self.W0, self.b0, padding=ICONV_PADDING)
 		hL, saved = self.forward(z0, self.blocks, self.rs, CONV_NORM_EPS)
-		y = self._head(hL)
+		if self.output == "logcounts":
+			y = self._head(hL)
+		else:
+			y, G0 = self._profile_head(hL, S, K)
+
 		del hL
 		Gz = self.backward(G0, saved, z0, self.blocks, self.rs, S, K)
+		del G0
 		del saved, z0
 
 		# iconv's input gradient, the call autograd makes for F.conv1d when

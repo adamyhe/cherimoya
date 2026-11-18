@@ -21,6 +21,21 @@ Attribution
   from the GPU's shared memory, falling back to PyTorch where they do not
   fit. Its attributions differ from tangermeme's by floating-point
   rounding; ``fast=False`` gives tangermeme's.
+* :func:`cherimoya.deep_lift_shap.deep_lift_shap` takes its fast path for
+  the profile too, ``output="profile"``, which attributes
+  :class:`cherimoya.ProfileWrapper`'s objective as before, 6.6 times
+  faster than tangermeme's ``deep_lift_shap`` on an RTX 3080 with 64
+  filters. Its attributions differ from tangermeme's by floating-point
+  rounding; ``fast=False`` gives tangermeme's.
+* ``output="negative_entropy"``, in
+  :func:`cherimoya.deep_lift_shap.deep_lift_shap` and ``cherimoya
+  attribute``, attributes the negative entropy of the predicted profile,
+  ``sum(p * log(p))`` of its softmax, through the new
+  :class:`cherimoya.NegativeEntropyWrapper`, on either path. Its
+  log-softmax takes the new DeepLIFT rule
+  :func:`cherimoya.deep_lift_shap.log_softmax_op`, which
+  :func:`~cherimoya.deep_lift_shap.attribution_ops` now returns for
+  ``torch.nn.LogSoftmax``.
 
 
 v0.3.1

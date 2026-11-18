@@ -14,7 +14,9 @@ def run(args):
 	from cherimoya import Cherimoya
 	from cherimoya import ControlWrapper
 	from cherimoya import LogCountWrapper
+	from cherimoya import NegativeEntropyWrapper
 	from cherimoya import ProfileWrapper
+	from cherimoya.deep_lift_shap import OUTPUTS
 	from cherimoya.deep_lift_shap import deep_lift_shap
 	from ..defaults import default_attribute_parameters
 	from ..utils import merge_parameters
@@ -34,8 +36,9 @@ def run(args):
 			stacklevel=2)
 		parameters["output"] = "logcounts"
 
-	if parameters["output"] not in ("logcounts", "profile"):
-		raise ValueError("output must be either `logcounts` or `profile`.")
+	if parameters["output"] not in OUTPUTS:
+		raise ValueError("output must be one of {}.".format(", ".join(
+			"`{}`".format(o) for o in OUTPUTS)))
 
 	if not isinstance(parameters["fast"], bool):
 		raise ValueError("`fast` must be true or false, got {!r}".format(
@@ -109,11 +112,9 @@ def run(args):
 			fast=parameters["fast"],
 		)[:, :, start:end].float()
 	else:
-		model = ControlWrapper(model)
-		if parameters["output"] == "logcounts":
-			wrapper = LogCountWrapper(model, group=group)
-		else:
-			wrapper = ProfileWrapper(model, group=group)
+		wrapper = {"logcounts": LogCountWrapper, "profile": ProfileWrapper,
+			"negative_entropy": NegativeEntropyWrapper}[parameters["output"]](
+			ControlWrapper(model), group=group)
 
 		X_attr = saturation_mutagenesis(
 			wrapper,

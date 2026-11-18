@@ -489,7 +489,8 @@ attribute_parameters
      - Chromosomes to attribute.
    * - ``output``
      - ``"logcounts"``
-     - Attribute to the log-counts or the profile (``"profile"``).
+     - Attribute to the log-counts, the profile (``"profile"``), or the
+       profile's negative entropy (``"negative_entropy"``).
        ``"counts"``, the former name of ``"logcounts"``, is deprecated:
        it warns and will be removed in cherimoya 0.7.0.
    * - ``group``

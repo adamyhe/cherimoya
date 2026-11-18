@@ -12,7 +12,9 @@ rather than a performance one — the attributions come back with no
 guarantee that they sum to the change in the prediction. The non-linear
 part of the profile head, in :class:`~cherimoya.ProfileWrapper`, is a
 ``torch.nn.Softmax`` and a tangermeme ``BilinearOp``, which tangermeme
-already has rules for.
+already has rules for. :class:`~cherimoya.NegativeEntropyWrapper` adds a
+``torch.nn.LogSoftmax``, which tangermeme has no rule for;
+:func:`log_softmax_op` is that rule.
 
 This is only needed for DeepLIFT/SHAP. :func:`deep_lift_shap`, and with it
 ``cherimoya attribute`` when ``algorithm`` is ``"deep_lift_shap"``, its
@@ -72,3 +74,9 @@ conv_norm_op
 ------------
 
 .. autofunction:: conv_norm_op
+
+
+log_softmax_op
+--------------
+
+.. autofunction:: log_softmax_op

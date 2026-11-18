@@ -40,6 +40,17 @@ F64 = torch.float64
 N_SEQUENCES = tiny.N_RANDOM + tiny.N_AT_RICH
 
 HYP_TOL = {torch.float32: 1e-5, F64: 1e-9}
+
+# The profile heads' rules divide changes in the logits by changes in the
+# logits, so in float32 the rounding of a logit that barely moves is
+# amplified, on either path. The engine computes those rules in float64, so
+# in float32 both paths are held to the float64 oracle: the engine at most
+# `PROFILE_F32_RATIO` times as far from it as tangermeme's float32 path,
+# plus `PROFILE_F32_SLACK` (at most 1.03 times and up to 30 times closer on
+# these cases), and within `PROFILE_F32_MAX` (1.0e-4 at most).
+PROFILE_F64_TOL = 1e-9
+PROFILE_F32_RATIO, PROFILE_F32_SLACK, PROFILE_F32_MAX = 1.25, 1e-6, 2e-4
+PROFILE_OUTPUTS = ("profile", "negative_entropy")
 DELTA_FP64 = 1e-9
 Y_FP64 = 1e-12
 STEP_TOL = 1e-12
@@ -74,22 +85,28 @@ def _case(config, kind):
 	raise ValueError(kind)
 
 
-def _engine(config, dtype, **kwargs):
+_GROUP = object()
+"""`_engine`'s and `_wrapped`'s default group: the config's."""
+
+
+def _engine(config, dtype, output="logcounts", group=_GROUP, **kwargs):
 	"""An Engine on a fresh tiny model, attributing the config's group."""
 
 	model = tiny.tiny_model(config, dtype=dtype)
-	return fdls.Engine(model, group=tiny.CONFIGS[config].group, **kwargs)
+	group = tiny.CONFIGS[config].group if group is _GROUP else group
+	return fdls.Engine(model, output=output, group=group, **kwargs)
 
 
 @functools.cache
-def _ours(config, dtype, kind, step=None):
+def _ours(config, dtype, kind, step=None, output="logcounts", group=_GROUP):
 	X, R = _case(config, kind)
-	return _engine(config, dtype, seqs_per_step=step).run(X, R)
+	return _engine(config, dtype, output, group, seqs_per_step=step).run(X, R)
 
 
-def _wrapped(config, dtype):
+def _wrapped(config, dtype, output="logcounts", group=_GROUP):
 	model = tiny.tiny_model(config, dtype=dtype)
-	return _make_wrapper(model, "logcounts", tiny.CONFIGS[config].group)
+	group = tiny.CONFIGS[config].group if group is _GROUP else group
+	return _make_wrapper(model, output, group)
 
 
 def _dy(result):
@@ -112,16 +129,48 @@ def test_attributions_match_tangermeme(config, dtype, kind):
 	assert float(tiny.rows_rel_l2(ours.attr, theirs).max()) <= HYP_TOL[dtype]
 
 
+# The profile heads on both configs, for the config's group and for every
+# group together (None), with every kind of reference, in float32 and
+# float64.
+PROFILE_CASES = [(config, dtype, kind, output, group)
+	for config in ("A", "B") for output in PROFILE_OUTPUTS
+	for group in (tiny.CONFIGS[config].group, None)
+	for dtype in (torch.float32, F64)
+	for kind in ("shuffled", "random", "identical", "mutated")]
+
+
+@pytest.mark.parametrize("config, dtype, kind, output, group", PROFILE_CASES)
+def test_profile_attributions_match_tangermeme(config, dtype, kind, output,
+	group):
+	X, R = _case(config, kind)
+	ours = _ours(config, dtype, kind, output=output, group=group)
+	truth = tiny.oracle(_wrapped(config, F64, output, group), X, R, F64)
+	assert ours.attr.shape == truth.shape == X.shape
+	assert ours.attr.dtype == ours.deltas.dtype == ours.y_x.dtype == dtype
+	assert ours.deltas.shape == ours.y_r.shape == (N_SEQUENCES, K)
+
+	error = float(tiny.rows_rel_l2(ours.attr, truth).max())
+	if dtype == F64:
+		assert error <= PROFILE_F64_TOL
+		return
+
+	theirs = tiny.oracle(_wrapped(config, dtype, output, group), X, R, dtype)
+	their_error = float(tiny.rows_rel_l2(theirs, truth).max())
+	assert error <= PROFILE_F32_RATIO * their_error + PROFILE_F32_SLACK
+	assert error <= PROFILE_F32_MAX
+
+
+@pytest.mark.parametrize("output", ["logcounts", *PROFILE_OUTPUTS])
 @pytest.mark.parametrize("config", ["A", "B"])
-def test_outputs_and_deltas_match_tangermeme(config):
+def test_outputs_and_deltas_match_tangermeme(config, output):
 	"""In float64: the outputs are the module's, the deltas are tangermeme's
 	expression over its own multipliers, and those multipliers are at least
 	10% from the plain gradient for every pair, so the tests here exercise
 	the rules."""
 
 	X, R = _case(config, "shuffled")
-	wrapped = _wrapped(config, F64)
-	ours = _ours(config, F64, "shuffled")
+	wrapped = _wrapped(config, F64, output)
+	ours = _ours(config, F64, "shuffled", output=output)
 	m = tiny.oracle(wrapped, X, R, F64, raw_outputs=True)
 
 	x, r = X.to(F64), R.to(F64)
@@ -147,15 +196,16 @@ def test_outputs_and_deltas_match_tangermeme(config):
 	assert float(rel.min()) >= RULES_MIN
 
 
+@pytest.mark.parametrize("output", ["logcounts", "profile"])
 @pytest.mark.parametrize("config", ["A", "B"])
-def test_results_do_not_depend_on_the_step_size(config):
+def test_results_do_not_depend_on_the_step_size(config, output):
 	"""Steps of 3 and 8 sequences against steps of 1, for 13 sequences, the
 	last step padded with copies of the last sequence. Rows are independent
 	in every operation, so only reassociation can differ."""
 
-	base = _ours(config, F64, "shuffled", 1)
+	base = _ours(config, F64, "shuffled", 1, output)
 	for step in (3, 8):
-		ours = _ours(config, F64, "shuffled", step)
+		ours = _ours(config, F64, "shuffled", step, output)
 		y_ref = torch.cat([base.y_x[:, None], base.y_r], dim=1).double()
 		y = torch.cat([ours.y_x[:, None], ours.y_r], dim=1).double()
 		errs = {

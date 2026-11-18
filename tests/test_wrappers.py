@@ -8,6 +8,7 @@ from numpy.testing import assert_array_almost_equal
 
 from cherimoya import Cherimoya
 from cherimoya.wrappers import ControlWrapper
+from cherimoya.wrappers import NegativeEntropyWrapper
 from cherimoya.wrappers import ProfileWrapper
 from cherimoya.wrappers import LogCountWrapper
 from cherimoya.wrappers import ExpectedCountsWrapper
@@ -115,6 +116,41 @@ def test_control_wrapper_composes_with_output_wrappers(control_model):
 
 	assert counts.shape == (2, 2)
 	assert profile.shape == (2, 1)
+
+
+# --------- NegativeEntropyWrapper ------------------------------------------
+
+
+@pytest.mark.parametrize("group", [None, 0, 1])
+def test_negative_entropy_wrapper_is_sum_p_log_p(grouped_model, group):
+	"""sum(p * log p) of the softmax over the group's flattened channels and
+	positions, or over every channel, and within [-log(n), 0]."""
+
+	L = _input_window_for(grouped_model)
+	torch.manual_seed(0)
+	X = torch.randn(3, 4, L)
+
+	with torch.no_grad():
+		y = NegativeEntropyWrapper(grouped_model, group=group)(X)
+		logits = grouped_model(X)[0]
+
+	if group is not None:
+		start = sum(grouped_model.signal_groups[:group])
+		logits = logits[:, start:start + grouped_model.signal_groups[group]]
+
+	logits = logits.flatten(1).double()
+	p = torch.softmax(logits, dim=-1)
+	expected = (p * torch.log(p)).sum(dim=-1, keepdim=True)
+
+	assert y.shape == (3, 1)
+	assert_array_almost_equal(y.double(), expected, 5)
+	assert bool((y <= 0).all())
+	assert bool((y >= -numpy.log(logits.shape[-1]) - 1e-5).all())
+
+
+def test_negative_entropy_wrapper_rejects_a_bad_group(grouped_model):
+	with pytest.raises(ValueError, match="group must be in"):
+		NegativeEntropyWrapper(grouped_model, group=2)
 
 
 # --------- ProfileWrapper --------------------------------------------------
