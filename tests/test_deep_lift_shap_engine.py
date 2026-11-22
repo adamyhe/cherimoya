@@ -29,7 +29,9 @@ import warnings
 import pytest
 import torch
 
+from cherimoya import ControlWrapper
 from cherimoya import _deep_lift_shap_engine as fdls
+from cherimoya import _pisa_engine as fpisa
 from cherimoya.deep_lift_shap import _make_wrapper
 
 from . import deep_lift_shap_engine_helpers as tiny
@@ -158,6 +160,44 @@ def test_profile_attributions_match_tangermeme(config, dtype, kind, output,
 	their_error = float(tiny.rows_rel_l2(theirs, truth).max())
 	assert error <= PROFILE_F32_RATIO * their_error + PROFILE_F32_SLACK
 	assert error <= PROFILE_F32_MAX
+
+
+@pytest.mark.parametrize("output", PROFILE_OUTPUTS)
+@pytest.mark.parametrize("config", ["A", "B"])
+def test_profile_attributions_are_head_weighted_pisa(config, output):
+	"""With one reference per sequence, a profile head's attributions are
+	the PISA engine's, one per attributed channel and output position,
+	weighted by the head's multipliers at those logits, in float64.
+
+	Below the logits every rule's multipliers are fixed by the forward,
+	so the backward is linear in the gradient it starts from. PISA starts
+	it from the profile convolution's taps at one logit, and this engine
+	from conv1d_input of the head's multipliers m, which is the sum of
+	those starting gradients times m. So for each pair the attributions
+	are sum_j m_j * PISA_j. m depends on the reference, so the identity
+	holds per pair, not for attributions averaged over several references,
+	and K = 1 makes the two the same. Config B's group has two channels,
+	so the sum also runs over channels, flattened channel by channel."""
+
+	X = tiny.sequences(config)[:3]
+	R = tiny.random_references(X, 1, seed=3)
+	model = tiny.tiny_model(config, dtype=F64)
+	group = tiny.CONFIGS[config].group
+	start = sum(model.signal_groups[:group])
+	end = start + model.signal_groups[group]
+
+	ours = fdls.Engine(model, output=output, group=group).run(X, R)
+	pisa = torch.stack([fpisa.Engine(model, channel=c, n_shuffles=1)
+		.run(X, R).attr for c in range(start, end)], dim=1)
+
+	with torch.no_grad():
+		logits = ControlWrapper(model)(torch.cat([X, R[:, 0]]).to(F64))[0]
+	_, m = fdls.profile_head_rule(logits[:, start:end].flatten(1), len(X), 1,
+		output)
+	expected = torch.einsum("ncj,ncjal->nal", m.view(pisa.shape[:3]), pisa)
+
+	assert ours.attr.shape == expected.shape == X.shape
+	assert float(tiny.rows_rel_l2(ours.attr, expected).max()) <= PROFILE_F64_TOL
 
 
 @pytest.mark.parametrize("output", ["logcounts", *PROFILE_OUTPUTS])

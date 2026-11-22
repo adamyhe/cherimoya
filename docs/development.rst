@@ -193,7 +193,9 @@ the ``cherimoya`` CLI:
        ``deep_lift_shap`` on small models, with four kinds of
        references, for the log-counts, the profile and the negative
        entropy: hypothetical attributions, outputs, convergence deltas,
-       step-size invariance, and its two convergence warnings.
+       step-size invariance, and its two convergence warnings. With one
+       reference per sequence, the profile heads' attributions against the
+       fast PISA engine's, weighted by the head's multipliers.
    * - ``tests/test_deep_lift_shap_paths.py``
      - :func:`~cherimoya.deep_lift_shap.deep_lift_shap`'s choice between
        tangermeme's ``deep_lift_shap`` and the fast path: ``fast=False``
